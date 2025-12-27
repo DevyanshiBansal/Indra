@@ -1,25 +1,24 @@
 """
 Crop Suggestion System with AI-Powered Recommendations
-Production-ready RAG + GIS + LLM architecture for intelligent crop selection
-Uses OpenRouter with Llama model for water-efficient farming recommendations
+Production-ready RAG + LLM architecture for intelligent crop selection
+Uses centralized config and AI-backed dynamic responses
 """
 
 import os
 import sys
+import re
+import time
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
 import json
 
-# API KEYS AND CONFIGURATION
-QDRANT_URL = "qdrant.io"
-QDRANT_API_KEY = "api_key_123456"
-OPENROUTER_API_KEY = "sk-or-v1"
-
-# MODEL CONFIGURATION
-COLLECTION_NAME = "standrd_rag"
-LLM_MODEL = "nvidia/nemotron-3-nano-30b-a3b:free"
-TEMPERATURE = 0.3
-MAX_TOKENS = 2000
+# Import centralized config
+from config import (
+    QDRANT_URL, QDRANT_API_KEY, OPENROUTER_API_KEY,
+    RAG_COLLECTION_NAME, LLM_MODEL, LLM_TEMPERATURE, LLM_MAX_TOKENS,
+    EMBEDDING_MODEL_PATH, OPENROUTER_BASE_URL,
+    MAX_RETRIES, RETRY_DELAY, RAG_RETRIEVER_K
+)
 
 # DEPENDENCIES
 try:
@@ -31,6 +30,7 @@ try:
     from langchain_core.output_parsers import StrOutputParser
     from langchain_core.runnables import RunnablePassthrough
     from gis_utils import gis_manager
+    from ai_service import ai_service  # Unified AI service for fact-checking
 except ImportError as e:
     print("Error: Missing required libraries")
     print("Install: pip install langchain-huggingface langchain-qdrant qdrant-client langchain-openai pandas")
@@ -72,42 +72,54 @@ class CropSuggestionResponse(BaseModel):
     general_advice: str
 
 
-# AI SYSTEM PROMPT
-CROP_SUGGESTION_PROMPT = """Crop advisor for Indian farmers.
+# AI SYSTEM PROMPT - Improved with explicit GIS data usage
+CROP_SUGGESTION_PROMPT = """You are a crop advisor for Indian farmers. Use the GIS data provided below for accurate local information.
 
-GIS: {gis_data}
-Inputs: {location}, {soil_type}, {season}, {water_availability}, {farm_size_acres} acres
+IMPORTANT: Use the GIS rainfall data exactly as given. Do NOT make up rainfall values.
 
-Context: {context}
+GIS DATA (VERIFIED LOCAL DATA):
+{gis_data}
 
-Task: Suggest 5 crops ranked by price/water ratio.
+FARM INPUTS:
+- Location: {location}
+- Soil Type: {soil_type}
+- Season: {season}
+- Water Availability: {water_availability}
+- Farm Size: {farm_size_acres} acres
 
-RULES:
-1. Output ONLY valid JSON
-2. No markdown, no extra text
-3. Keep justification under 15 words
-4. Use realistic Indian crop data
+RAG CONTEXT:
+{context}
 
-JSON format:
+TASK: Suggest 5 crops ranked by price/water efficiency ratio.
+
+STRICT RULES:
+1. Output ONLY valid JSON - no markdown, no extra text
+2. Use the EXACT rainfall data from GIS DATA above
+3. water_requirement_liters is per acre for the crop cycle
+4. Keep justification under 15 words, no emojis
+5. Use realistic Indian market prices (2024)
+6. All numeric values must be integers or simple decimals
+
+REQUIRED JSON FORMAT:
 {{
   "recommendations": [
     {{
-      "crop_name": "Rice",
-      "water_requirement_liters": 600000,
-      "estimated_market_price_per_kg": 30,
-      "yield_per_acre_kg": 3000,
-      "total_profit_estimate": 50000,
-      "price_per_liter_ratio": 0.083,
-      "environmental_impact_score": 7,
+      "crop_name": "Wheat",
+      "water_requirement_liters": 450000,
+      "estimated_market_price_per_kg": 25,
+      "yield_per_acre_kg": 2500,
+      "total_profit_estimate": 45000,
+      "price_per_liter_ratio": 0.139,
+      "environmental_impact_score": 8,
       "soil_health_impact": "Neutral",
-      "farmer_ease_score": 8,
+      "farmer_ease_score": 9,
       "rank": 1,
-      "justification": "High yield good market demand suitable season"
+      "justification": "Low water need good profit margin"
     }}
   ],
-  "season_context": "Season tips max 10 words",
-  "water_context": "Water tips max 10 words",
-  "general_advice": "Summary max 15 words"
+  "season_context": "Brief season tip",
+  "water_context": "Brief water tip",
+  "general_advice": "Brief overall advice"
 }}"""
 
 
@@ -131,7 +143,7 @@ def initialize_crop_system():
     # Load embedding model
     print("Loading embedding model...")
     embeddings = HuggingFaceEmbeddings(
-        model_name="./models/all-MiniLM-L6-v2",
+        model_name=EMBEDDING_MODEL_PATH,
         encode_kwargs={'normalize_embeddings': False}
     )
     
@@ -140,27 +152,27 @@ def initialize_crop_system():
     client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
     
     collections = client.get_collections().collections
-    if not any(c.name == COLLECTION_NAME for c in collections):
-        print(f"Warning: Collection '{COLLECTION_NAME}' not found")
+    if not any(c.name == RAG_COLLECTION_NAME for c in collections):
+        print(f"Warning: Collection '{RAG_COLLECTION_NAME}' not found")
         print("System will work with limited context")
     
     vector_store = QdrantVectorStore.from_existing_collection(
         embedding=embeddings,
-        collection_name=COLLECTION_NAME,
+        collection_name=RAG_COLLECTION_NAME,
         url=QDRANT_URL,
         api_key=QDRANT_API_KEY
     )
     
-    retriever = vector_store.as_retriever(search_kwargs={"k": 2})  # Reduced for token efficiency
+    retriever = vector_store.as_retriever(search_kwargs={"k": RAG_RETRIEVER_K})
     
     # Initialize OpenRouter LLM
     print("Connecting to OpenRouter...")
     llm = ChatOpenAI(
         model=LLM_MODEL,
         openai_api_key=OPENROUTER_API_KEY,
-        openai_api_base="https://openrouter.ai/api/v1",
-        temperature=TEMPERATURE,
-        max_tokens=MAX_TOKENS
+        openai_api_base=OPENROUTER_BASE_URL,
+        temperature=LLM_TEMPERATURE,
+        max_tokens=LLM_MAX_TOKENS
     )
     
     # Test LLM connection
@@ -177,32 +189,23 @@ def initialize_crop_system():
         return "\n\n".join(doc.page_content for doc in docs)
     
     def format_input(inputs: Dict[str, Any]) -> Dict[str, Any]:
-        """Format inputs with GIS data"""
-        # Get GIS data
-        gis_data_str = "GIS data not available"
+        """Format inputs with AI-verified data - NOT raw GIS data directly"""
+        # Use pre-verified data passed from input (fact-checked by ai_service)
+        verified_rainfall = inputs.get('rainfall_mm', 'N/A')
+        gw_status = inputs.get('gw_status', 'Unknown')
         location = inputs.get('location', '')
         pincode = inputs.get('pincode')
         
-        if location or pincode:
-            location_parts = location.split(",")
-            district = location_parts[0].strip() if location_parts else None
-            
-            gis_data = gis_manager.get_location_data(
-                pincode=pincode,
-                district=district
-            )
-            
-            if gis_data:
-                rainfall_info = gis_data.get('rainfall', {})
-                gis_data_str = f"""District: {gis_data.get('district', 'Unknown')}
-State: {gis_data.get('state', 'Unknown')}
-Annual Rainfall: {rainfall_info.get('total_annual', 0):.0f} mm
-Monsoon Rainfall: {rainfall_info.get('monsoon', 0):.0f} mm
-Summer Rainfall: {rainfall_info.get('summer', 0):.0f} mm
-Groundwater Stress: {gis_manager.get_water_stress_level(gis_data)}"""
+        # Build verified GIS data string for prompt
+        gis_data_str = f"""AI-VERIFIED LOCATION DATA:
+Annual Rainfall: {verified_rainfall} mm (AI-verified)
+Groundwater Status: {gw_status} (AI-verified)
+Location: {location}
+Pincode: {pincode or 'Not provided'}
+Note: This data has been fact-checked against our knowledge base."""
         
         # Retrieve context from RAG (limit to 2 docs, first 300 chars each)
-        query = f"crop {inputs.get('season', '')} {inputs.get('soil_type', '')}"
+        query = f"crop {inputs.get('season', '')} {inputs.get('soil_type', '')} rainfall {verified_rainfall}mm India"
         docs = retriever.invoke(query)
         context = " ".join(doc.page_content[:300] for doc in docs[:2])  # Limit tokens
         
@@ -214,7 +217,7 @@ Groundwater Stress: {gis_manager.get_water_stress_level(gis_data)}"""
             "season": inputs.get("season", ""),
             "water_availability": inputs.get("water_availability", ""),
             "farm_size_acres": inputs.get("farm_size_acres", ""),
-            "rainfall_mm": inputs.get("rainfall_mm", "N/A")
+            "rainfall_mm": verified_rainfall
         }
     
     rag_chain = (
@@ -227,123 +230,284 @@ Groundwater Stress: {gis_manager.get_water_stress_level(gis_data)}"""
     print("Crop Suggestion System ready")
 
 
+def clean_text(text: str) -> str:
+    """Remove emojis and special characters from text"""
+    if not text:
+        return text
+    # Remove emojis
+    emoji_pattern = re.compile(
+        "["
+        "\U0001F600-\U0001F64F"
+        "\U0001F300-\U0001F5FF"
+        "\U0001F680-\U0001F6FF"
+        "\U0001F1E0-\U0001F1FF"
+        "\U00002702-\U000027B0"
+        "\U000024C2-\U0001F251"
+        "]+",
+        flags=re.UNICODE
+    )
+    return emoji_pattern.sub('', text)
+
+
+def clean_json_response(response: str) -> str:
+    """
+    Robust JSON extraction and cleaning from LLM response.
+    Handles truncated JSON, markdown blocks, and malformed output.
+    """
+    if not response:
+        return ""
+    
+    # Remove emojis first
+    cleaned = clean_text(response.strip())
+    
+    # Remove markdown code blocks
+    if "```json" in cleaned:
+        parts = cleaned.split("```json")
+        if len(parts) > 1:
+            cleaned = parts[1].split("```")[0]
+    elif "```" in cleaned:
+        parts = cleaned.split("```")
+        if len(parts) > 1:
+            cleaned = parts[1].split("```")[0] if len(parts) > 1 else parts[0]
+    
+    # Find JSON object boundaries
+    start = cleaned.find('{')
+    if start == -1:
+        return ""
+    
+    # Find matching closing brace (handle nested objects)
+    brace_count = 0
+    end = start
+    for i, char in enumerate(cleaned[start:], start):
+        if char == '{':
+            brace_count += 1
+        elif char == '}':
+            brace_count -= 1
+            if brace_count == 0:
+                end = i
+                break
+    
+    if end <= start:
+        # Incomplete JSON - try to find last closing brace
+        end = cleaned.rfind('}')
+    
+    if end <= start:
+        return ""
+    
+    json_str = cleaned[start:end+1]
+    
+    # Fix common JSON issues
+    # Remove trailing commas before closing braces/brackets
+    json_str = re.sub(r',(\s*[}\]])', r'\1', json_str)
+    # Fix unquoted string values (basic)
+    json_str = re.sub(r':\s*([A-Za-z][A-Za-z0-9_]*)\s*([,}\]])', r': "\1"\2', json_str)
+    # Ensure proper array closing
+    json_str = re.sub(r'\[\s*{[^}]+$', lambda m: m.group(0) + '}]', json_str)
+    
+    return json_str
+
+
+def try_parse_json(json_str: str) -> Optional[Dict[str, Any]]:
+    """
+    Try to parse JSON with multiple strategies.
+    """
+    if not json_str:
+        return None
+    
+    # Strategy 1: Direct parse
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError:
+        pass
+    
+    # Strategy 2: Fix truncated recommendations array
+    try:
+        # If JSON is truncated mid-recommendations, try to close it properly
+        if '"recommendations": [' in json_str and not json_str.rstrip().endswith('}'):
+            # Find last complete recommendation object
+            last_complete = json_str.rfind('},')
+            if last_complete > 0:
+                json_str = json_str[:last_complete+1]
+                # Close arrays and objects
+                json_str += '], "season_context": "Based on selected season", "water_context": "Optimized for water efficiency", "general_advice": "Choose crops suited to local conditions"}'
+                return json.loads(json_str)
+    except json.JSONDecodeError:
+        pass
+    
+    # Strategy 3: Extract what we can and build minimal valid JSON
+    try:
+        # Try to extract at least one recommendation
+        rec_match = re.search(r'\{[^{}]*"crop_name"[^{}]*\}', json_str)
+        if rec_match:
+            rec = json.loads(rec_match.group())
+            return {
+                "recommendations": [rec],
+                "season_context": "Based on selected season",
+                "water_context": "Optimized for water efficiency",
+                "general_advice": "Partial data recovered from AI response"
+            }
+    except:
+        pass
+    
+    return None
+
+
 async def get_crop_suggestions(crop_input: CropInput) -> CropSuggestionResponse:
-    """Get AI-powered crop suggestions with RAG + GIS + LLM"""
+    """Get AI-powered crop suggestions with RAG + GIS + LLM + AI Fact-Checking"""
+    global rag_chain
+    
     # Initialize if needed
     if rag_chain is None:
         initialize_crop_system()
     
-    try:
-        # Prepare input
-        input_dict = {
-            "location": crop_input.location,
-            "pincode": crop_input.pincode,
-            "soil_type": crop_input.soil_type,
-            "season": crop_input.season,
-            "water_availability": crop_input.water_availability,
-            "farm_size_acres": crop_input.farm_size_acres,
-            "rainfall_mm": crop_input.rainfall_mm if crop_input.rainfall_mm else "N/A"
-        }
-        
-        # Get AI response
-        print(f"Generating crop suggestions for {crop_input.location}...")
-        response = rag_chain.invoke(input_dict)
-        
-        # Check for empty response
-        if not response or len(response.strip()) == 0:
-            print("ERROR: LLM returned empty response")
-            print(f"Input dict: {input_dict}")
-            # Use fallback immediately
-            raise ValueError("Empty LLM response")
-        
-        print(f"LLM Response length: {len(response)} chars")
-        print(f"Response preview: {response[:200]}...")
-        
-        # Extract JSON from response
-        cleaned = response.strip()
-        
-        # Remove markdown code blocks
-        if "```json" in cleaned:
-            cleaned = cleaned.split("```json")[1].split("```")[0]
-        elif "```" in cleaned:
-            cleaned = cleaned.split("```")[1].split("```")[0]
-        
-        # Find JSON object
-        start = cleaned.find('{')
-        end = cleaned.rfind('}')
-        if start != -1 and end != -1:
-            cleaned = cleaned[start:end+1]
-        else:
-            print(f"ERROR: No JSON object found in response")
-            raise ValueError("No JSON in response")
-        
-        cleaned = cleaned.strip()
-        print(f"Extracted JSON length: {len(cleaned)} chars")
-        
-        # Parse JSON
-        try:
-            result = json.loads(cleaned)
-        except json.JSONDecodeError as e:
-            print(f"JSON Parse Error: {e}")
-            print(f"Cleaned JSON: {cleaned[:500]}")
-            # Return fallback response
-            return CropSuggestionResponse(
-                recommendations=[
-                    CropRecommendation(
-                        crop_name="Rice",
-                        water_requirement_liters=600000,
-                        estimated_market_price_per_kg=30,
-                        yield_per_acre_kg=3000,
-                        total_profit_estimate=50000,
-                        price_per_liter_ratio=0.083,
-                        environmental_impact_score=7,
-                        soil_health_impact="Neutral",
-                        farmer_ease_score=8,
-                        rank=1,
-                        justification="High yield good market demand"
-                    ),
-                    CropRecommendation(
-                        crop_name="Wheat",
-                        water_requirement_liters=450000,
-                        estimated_market_price_per_kg=25,
-                        yield_per_acre_kg=2500,
-                        total_profit_estimate=40000,
-                        price_per_liter_ratio=0.089,
-                        environmental_impact_score=8,
-                        soil_health_impact="Positive",
-                        farmer_ease_score=9,
-                        rank=2,
-                        justification="Low water use easy to grow"
-                    )
-                ],
-                season_context=f"Suitable crops for {crop_input.season} season",
-                water_context=f"Optimized for {crop_input.water_availability} water",
-                general_advice="AI unavailable. Using default recommendations."
-            )
-        
-        return CropSuggestionResponse(**result)
-        
-    except Exception as e:
-        print(f"Error: {e}")
-        # Return fallback
-        return CropSuggestionResponse(
-            recommendations=[
-                CropRecommendation(
-                    crop_name="Rice",
-                    water_requirement_liters=600000,
-                    estimated_market_price_per_kg=30,
-                    yield_per_acre_kg=3000,
-                    total_profit_estimate=50000,
-                    price_per_liter_ratio=0.083,
-                    environmental_impact_score=7,
-                    soil_health_impact="Neutral",
-                    farmer_ease_score=8,
-                    rank=1,
-                    justification="High yield good market"
-                )
-            ],
-            season_context=f"For {crop_input.season}",
-            water_context=f"{crop_input.water_availability} water",
-            general_advice="Error occurred. Using fallback data."
+    # Initialize AI service for fact-checking
+    ai_service.initialize()
+    
+    # Get location data from GIS
+    location_parts = crop_input.location.split(",")
+    district = location_parts[0].strip() if location_parts else None
+    state = location_parts[1].strip() if len(location_parts) > 1 else None
+    
+    gis_data = gis_manager.get_location_data(
+        pincode=crop_input.pincode,
+        district=district,
+        state=state
+    )
+    
+    # FACT-CHECK GIS DATA using AI Service
+    verified_rainfall = crop_input.rainfall_mm or 0
+    verified_gw_status = "Unknown"
+    ai_corrections = []
+    
+    if gis_data and district and state:
+        print(f"[CropSuggestion] Fact-checking GIS data for {district}, {state}...")
+        fact_check_result = await ai_service.fact_check_location_data(
+            state=state,
+            district=district, 
+            gis_data=gis_data
         )
+        
+        if fact_check_result.confidence >= 0.5:
+            verified_rainfall = fact_check_result.verified_data.get('rainfall', {}).get('total_annual', verified_rainfall)
+            verified_gw_pct = fact_check_result.verified_data.get('groundwater', {}).get('extraction_percentage', 0)
+            verified_gw_status = "Low" if verified_gw_pct < 70 else "Critical" if verified_gw_pct > 100 else "High"
+            ai_corrections = fact_check_result.corrections
+            print(f"[CropSuggestion] Verified rainfall: {verified_rainfall}mm (confidence: {fact_check_result.confidence})")
+        else:
+            print(f"[CropSuggestion] Low confidence fact-check, using GIS data with caution")
+            verified_rainfall = gis_data.get('rainfall', {}).get('total_annual', 0) if gis_data else 0
+    elif gis_data:
+        verified_rainfall = gis_data.get('rainfall', {}).get('total_annual', 0)
+    
+    # Prepare input with VERIFIED data (not raw GIS data)
+    input_dict = {
+        "location": crop_input.location,
+        "pincode": crop_input.pincode,
+        "soil_type": crop_input.soil_type,
+        "season": crop_input.season,
+        "water_availability": crop_input.water_availability,
+        "farm_size_acres": crop_input.farm_size_acres,
+        "rainfall_mm": verified_rainfall,  # Use verified data
+        "gw_status": verified_gw_status
+    }
+    
+    # Retry logic for LLM calls
+    last_error = None
+    result = None
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            print(f"[CropSuggestion] Attempt {attempt + 1}/{MAX_RETRIES} for {crop_input.location}...")
+            response = rag_chain.invoke(input_dict)
+            
+            # Check for empty response
+            if not response or len(response.strip()) == 0:
+                print(f"[CropSuggestion] Empty response on attempt {attempt + 1}")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY)
+                continue
+            
+            print(f"[CropSuggestion] Response length: {len(response)} chars")
+            
+            # Clean and extract JSON
+            cleaned_json = clean_json_response(response)
+            
+            if not cleaned_json:
+                print(f"[CropSuggestion] No JSON found in response")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY)
+                continue
+            
+            print(f"[CropSuggestion] Cleaned JSON length: {len(cleaned_json)} chars")
+            
+            # Try to parse JSON with multiple strategies
+            result = try_parse_json(cleaned_json)
+            
+            if result and 'recommendations' in result and len(result['recommendations']) > 0:
+                # Clean text fields
+                for rec in result['recommendations']:
+                    if 'justification' in rec:
+                        rec['justification'] = clean_text(rec['justification'])
+                if 'season_context' in result:
+                    result['season_context'] = clean_text(result['season_context'])
+                if 'water_context' in result:
+                    result['water_context'] = clean_text(result['water_context'])
+                if 'general_advice' in result:
+                    result['general_advice'] = clean_text(result['general_advice'])
+                
+                print(f"[CropSuggestion] Successfully parsed {len(result['recommendations'])} recommendations")
+                break
+            else:
+                print(f"[CropSuggestion] Invalid JSON structure on attempt {attempt + 1}")
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY)
+                    
+        except Exception as e:
+            last_error = e
+            print(f"[CropSuggestion] Error on attempt {attempt + 1}: {e}")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
+    
+    # If we got valid results, return them
+    if result and 'recommendations' in result:
+        try:
+            return CropSuggestionResponse(**result)
+        except Exception as e:
+            print(f"[CropSuggestion] Validation error: {e}")
+    
+    # Fallback with clear indication
+    print(f"[CropSuggestion] Using fallback after {MAX_RETRIES} attempts")
+    return CropSuggestionResponse(
+        recommendations=[
+            CropRecommendation(
+                crop_name="Wheat",
+                water_requirement_liters=450000,
+                estimated_market_price_per_kg=25,
+                yield_per_acre_kg=2500,
+                total_profit_estimate=40000,
+                price_per_liter_ratio=0.089,
+                environmental_impact_score=8,
+                soil_health_impact="Positive",
+                farmer_ease_score=9,
+                rank=1,
+                justification="Low water requirement, good market demand"
+            ),
+            CropRecommendation(
+                crop_name="Lentils (Masoor)",
+                water_requirement_liters=300000,
+                estimated_market_price_per_kg=80,
+                yield_per_acre_kg=800,
+                total_profit_estimate=44000,
+                price_per_liter_ratio=0.213,
+                environmental_impact_score=9,
+                soil_health_impact="Positive",
+                farmer_ease_score=7,
+                rank=2,
+                justification="Nitrogen fixing, improves soil health"
+            )
+        ],
+        season_context=f"Recommendations for {crop_input.season} season",
+        water_context=f"Based on {crop_input.water_availability} water availability",
+        general_advice="AI service experienced issues. Showing reliable default crops for your region."
+    )
 

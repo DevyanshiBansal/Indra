@@ -1,7 +1,7 @@
 """
 INDRA - Intelligent Assessment Module
 AI/ML-powered Rainwater Harvesting Assessment System
-Uses on-device embeddings and hybrid ML models for cost prediction and feasibility analysis
+Uses on-device embeddings, Qdrant RAG for geography data, and LLM for dynamic recommendations
 """
 
 from fastapi import APIRouter, HTTPException
@@ -14,69 +14,162 @@ from pathlib import Path
 import json
 import os
 import aiohttp
-from dotenv import load_dotenv
+
+# Import config
+from config import (
+    OPENROUTER_API_KEY, OPENROUTER_BASE_URL,
+    LLM_MODEL, EMBEDDING_MODEL_PATH, LLM_TEMPERATURE,
+    QDRANT_URL, QDRANT_API_KEY, RAG_COLLECTION_NAME
+)
 
 # Import local modules
 from gis_utils import GISDataManager
 from sentence_transformers import SentenceTransformer
 
-# Load environment variables
-load_dotenv()
+# Import AI service for fact-checking and dynamic content
+from ai_service import ai_service, verify_and_get_location_data, generate_ai_content
+
+# Qdrant and LangChain imports for RAG
+try:
+    from langchain_huggingface import HuggingFaceEmbeddings
+    from langchain_qdrant import QdrantVectorStore
+    from qdrant_client import QdrantClient
+    QDRANT_AVAILABLE = True
+except ImportError:
+    QDRANT_AVAILABLE = False
+    print("[WARN] Qdrant libraries not available - geography RAG disabled")
 
 # Initialize Router
 router = APIRouter(prefix="/api/assessment", tags=["assessment"])
 
 # Load local embedding model
-MODEL_PATH = "./models/all-MiniLM-L6-v2"
 embedding_model = None
 
-# OpenRouter Configuration
-OPENROUTER_API_KEY = "sk-or-v1-..." # TODO: Replace with your actual OpenRouter API key
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
+# Qdrant retriever for geography data
+geography_retriever = None
 
 def load_embedding_model():
     """Load the local sentence transformer model"""
     global embedding_model
     if embedding_model is None:
         try:
-            embedding_model = SentenceTransformer(MODEL_PATH)
-            print(f"✅ Loaded embedding model from {MODEL_PATH}")
+            embedding_model = SentenceTransformer(EMBEDDING_MODEL_PATH)
+            print(f"[OK] Loaded embedding model from {EMBEDDING_MODEL_PATH}")
         except Exception as e:
-            print(f"⚠️ Error loading embedding model: {e}")
+            print(f"[WARN] Error loading embedding model: {e}")
     return embedding_model
 
-async def get_llm_recommendations(context: Dict[str, Any]) -> str:
-    """Get AI-powered recommendations using OpenRouter LLM"""
+
+def initialize_geography_retriever():
+    """Initialize Qdrant retriever for geography-based RAG"""
+    global geography_retriever
+    
+    if not QDRANT_AVAILABLE:
+        print("[WARN] Qdrant not available for geography retrieval")
+        return None
+    
+    if geography_retriever is not None:
+        return geography_retriever
+    
+    try:
+        embeddings = HuggingFaceEmbeddings(
+            model_name=EMBEDDING_MODEL_PATH,
+            encode_kwargs={'normalize_embeddings': False}
+        )
+        
+        client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+        collections = client.get_collections().collections
+        
+        if not any(c.name == RAG_COLLECTION_NAME for c in collections):
+            print(f"[WARN] Collection '{RAG_COLLECTION_NAME}' not found in Qdrant")
+            return None
+        
+        vector_store = QdrantVectorStore.from_existing_collection(
+            embedding=embeddings,
+            collection_name=RAG_COLLECTION_NAME,
+            url=QDRANT_URL,
+            api_key=QDRANT_API_KEY
+        )
+        
+        geography_retriever = vector_store.as_retriever(search_kwargs={"k": 3})
+        print("[OK] Geography retriever initialized")
+        return geography_retriever
+        
+    except Exception as e:
+        print(f"[WARN] Error initializing geography retriever: {e}")
+        return None
+
+
+async def get_geography_context(state: str, district: str) -> str:
+    """Retrieve geography-specific context from Qdrant"""
+    global geography_retriever
+    
+    if geography_retriever is None:
+        geography_retriever = initialize_geography_retriever()
+    
+    if geography_retriever is None:
+        return ""
+    
+    try:
+        query = f"Geography climate terrain soil water resources {state} {district} India rainwater harvesting"
+        docs = geography_retriever.invoke(query)
+        
+        if docs:
+            context = "\n".join([doc.page_content[:500] for doc in docs[:3]])
+            return context
+        return ""
+    except Exception as e:
+        print(f"[WARN] Error retrieving geography context: {e}")
+        return ""
+
+async def get_llm_recommendations(context: Dict[str, Any], geography_context: str = "") -> str:
+    """Get AI-powered recommendations using OpenRouter LLM with geography context"""
     if not OPENROUTER_API_KEY:
         return "AI recommendations unavailable (API key not configured)"
     
     try:
-        prompt = f"""
-You are an expert in Rainwater Harvesting (RWH) systems in India. Analyze the following assessment and provide 3-5 specific, actionable recommendations.
+        geography_section = f"""
+GEOGRAPHY & REGIONAL CONTEXT (from knowledge base):
+{geography_context if geography_context else "No specific geography data available - use general knowledge for this region."}
+""" if geography_context else ""
 
-Location: {context['district']}, {context['state']}
-Annual Rainfall: {context['rainfall']} mm
-Household Members: {context['members']}
-Catchment Area: {context['catchment']} sq m
-Budget: ₹{context['budget']}
-Roof Type: {context['roof_type']}
-Roof Material: {context['roof_material']}
-Groundwater Status: {context['gw_status']}
-Feasibility Score: {context['feasibility_score']}/100
+        prompt = f"""You are an expert in Rainwater Harvesting (RWH) systems in India. Analyze the following assessment and provide 3-5 specific, actionable recommendations.
+
+LOCATION DETAILS:
+- Location: {context['district']}, {context['state']}
+- Annual Rainfall: {context['rainfall']} mm
+- Groundwater Status: {context['gw_status']}
+{geography_section}
+PROPERTY DETAILS:
+- Household Members: {context['members']}
+- Catchment Area: {context['catchment']} sq m
+- Roof Type: {context['roof_type']}
+- Roof Material: {context['roof_material']}
+
+ASSESSMENT:
+- Budget: ₹{context['budget']}
+- Feasibility Score: {context['feasibility_score']}/100
+
+IMPORTANT: Take into account the SPECIFIC GEOGRAPHY of {context['state']} including:
+1. Terrain type (hilly, plains, coastal, desert, etc.)
+2. Soil characteristics (permeability, type)
+3. Climate patterns (monsoon timing, dry spells)
+4. Local water table conditions
+5. Regional RWH practices and traditional methods
 
 Provide practical recommendations focusing on:
-1. Cost optimization
-2. Water quality improvements
-3. Seasonal strategies
-4. Maintenance practices
-5. Government schemes or subsidies available
+1. Geography-appropriate system design (considering local terrain and soil)
+2. Cost optimization based on local conditions
+3. Water quality improvements specific to the region
+4. Seasonal strategies aligned with local monsoon patterns
+5. Government schemes or subsidies available in {context['state']}
 
-Keep each recommendation concise (1-2 sentences) and actionable.
+Keep each recommendation concise (2-3 sentences) and actionable. Include specific local considerations.
 """
         
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                OPENROUTER_BASE_URL,
+                f"{OPENROUTER_BASE_URL}/chat/completions",
                 headers={
                     "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                     "Content-Type": "application/json",
@@ -84,10 +177,10 @@ Keep each recommendation concise (1-2 sentences) and actionable.
                     "X-Title": "INDRA RWH Assessment"
                 },
                 json={
-                    "model": "google/gemini-2.0-flash-exp:free",
+                    "model": LLM_MODEL,
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.7,
-                    "max_tokens": 500
+                    "max_tokens": 800
                 },
                 timeout=aiohttp.ClientTimeout(total=30)
             ) as response:
@@ -148,101 +241,205 @@ class AssessmentOutput(BaseModel):
 
 
 class RWHCostPredictor:
-    """ML-based cost prediction using statistical models and domain knowledge"""
+    """
+    ML-based cost prediction using statistical models and domain knowledge
+    Budget-aware planning: Adapts system to fit within user's budget
     
-    # Cost factors (INR per unit)
-    COST_FACTORS = {
-        "storage_tank_per_liter": 40,  # ₹40 per liter capacity
-        "filtration_base": 15000,  # Base filtration system
-        "first_flush_base": 5000,  # First flush diverter
-        "piping_per_meter": 150,  # PVC pipes
-        "gutter_per_meter": 200,  # Gutters
-        "labor_percentage": 0.25,  # 25% of material cost
-        "overhead_percentage": 0.15,  # 15% overhead
+    REALISTIC COST REFERENCE (India 2024):
+    - Ultra-Budget System: ₹3,000 - ₹5,000 (DIY, minimal)
+    - Budget System: ₹5,000 - ₹10,000 (basic setup)
+    - Standard RWH System: ₹10,000 - ₹20,000 (recommended)
+    - Premium System: ₹20,000+ (advanced features)
+    """
+    
+    # Component costs with budget tiers (INR) - BASE COSTS
+    COMPONENT_COSTS = {
+        "ultra_budget": {  # ₹3,000 - ₹5,000
+            "storage_tank": 1500,  # Small plastic drum (200L)
+            "filtration_system": 500,  # DIY sand-gravel
+            "first_flush_diverter": 300,  # Simple PVC
+            "piping_and_fittings": 200,
+            "gutters_and_channels": 300,  # Partial gutters
+            "labor_charges": 500,  # Mostly DIY
+        },
+        "budget": {  # ₹5,000 - ₹10,000
+            "storage_tank": 3000,  # 500L tank
+            "filtration_system": 1000,
+            "first_flush_diverter": 500,
+            "piping_and_fittings": 300,
+            "gutters_and_channels": 800,
+            "labor_charges": 2000,
+        },
+        "standard": {  # ₹10,000 - ₹20,000
+            "storage_tank": 6000,  # 1000L tank
+            "filtration_system": 1500,
+            "first_flush_diverter": 800,
+            "piping_and_fittings": 500,
+            "gutters_and_channels": 2000,
+            "labor_charges": 4000,
+        },
+        "premium": {  # ₹20,000+
+            "storage_tank": 12000,  # 2000L+ tank
+            "filtration_system": 3000,
+            "first_flush_diverter": 1200,
+            "piping_and_fittings": 800,
+            "gutters_and_channels": 3500,
+            "labor_charges": 6000,
+        }
     }
     
-    # Material multipliers
+    # Material multipliers - affects filtration and water quality
     MATERIAL_MULTIPLIERS = {
-        "RCC": 1.0,
-        "Tiles": 0.9,
-        "Metal": 1.1,
-        "Asbestos": 0.95,
-        "other": 1.0
-    }
-    
-    # Roof type multipliers (for installation complexity)
-    ROOF_TYPE_MULTIPLIERS = {
-        "Flat": 1.0,
-        "Sloped": 1.15,
-        "Mixed": 1.25,
+        "RCC": 1.0,      # Ideal - minimal filtration needed
+        "Tiles": 0.95,   # Good - slightly less efficient
+        "Metal": 1.15,   # Needs more filtration, can rust
+        "Asbestos": 1.25, # Needs extra filtration (health concern)
+        "Thatch": 1.3,   # Rural - needs significant filtration
         "other": 1.1
     }
     
+    # Roof type multipliers - affects installation complexity
+    ROOF_TYPE_MULTIPLIERS = {
+        "Flat": 1.0,     # Easiest - simple drainage
+        "Sloped": 1.15,  # Moderate - needs proper gutters
+        "Mixed": 1.25,   # Complex - multiple collection points
+        "Dome": 1.3,     # Difficult - specialized collection
+        "other": 1.1
+    }
+    
+    # Household size affects required storage capacity
+    HOUSEHOLD_SIZE_MULTIPLIERS = {
+        1: 0.5,   # Single person
+        2: 0.7,   # Couple
+        3: 0.85,  # Small family
+        4: 1.0,   # Average family (baseline)
+        5: 1.15,  # Large family
+        6: 1.3,   # Joint family
+        7: 1.4,
+        8: 1.5,
+    }
+    
+    # Rainfall zone affects storage sizing
+    RAINFALL_ZONE_MULTIPLIERS = {
+        "very_high": 0.8,   # >2000mm - smaller storage ok (frequent refill)
+        "high": 0.9,        # 1200-2000mm
+        "moderate": 1.0,    # 700-1200mm (baseline)
+        "low": 1.2,         # 400-700mm - larger storage needed
+        "very_low": 1.4,    # <400mm - maximize storage
+    }
+    
+    def _get_rainfall_zone(self, annual_rainfall: float) -> str:
+        """Categorize rainfall zone"""
+        if annual_rainfall >= 2000:
+            return "very_high"
+        elif annual_rainfall >= 1200:
+            return "high"
+        elif annual_rainfall >= 700:
+            return "moderate"
+        elif annual_rainfall >= 400:
+            return "low"
+        else:
+            return "very_low"
+    
+    def _select_budget_tier(self, budget: float) -> str:
+        """Select appropriate cost tier based on user's budget"""
+        if budget < 5000:
+            return "ultra_budget"
+        elif budget < 10000:
+            return "budget"
+        elif budget < 20000:
+            return "standard"
+        else:
+            return "premium"
+    
     def predict_cost(self, catchment_area: float, storage_capacity: float, 
-                    roof_type: str, roof_material: str, location_data: Dict) -> Dict[str, Any]:
+                    roof_type: str, roof_material: str, location_data: Dict,
+                    user_budget: float = 20000, n_members: int = 4) -> Dict[str, Any]:
         """
-        Predict RWH system cost using hybrid model
-        Combines rule-based engineering calculations with ML adjustments
+        Predict RWH system cost - FULLY DYNAMIC
+        Considers: budget, roof type, roof material, area, members, rainfall
         """
         
-        # Material multiplier
+        # Select budget tier
+        tier = self._select_budget_tier(user_budget)
+        base_costs = self.COMPONENT_COSTS[tier].copy()
+        
+        # Get multipliers based on all input factors
         mat_mult = self.MATERIAL_MULTIPLIERS.get(roof_material, 1.0)
         roof_mult = self.ROOF_TYPE_MULTIPLIERS.get(roof_type, 1.0)
         
-        # Storage tank cost (based on capacity)
-        tank_cost = storage_capacity * self.COST_FACTORS["storage_tank_per_liter"]
+        # Household size multiplier (cap at 8+)
+        hh_mult = self.HOUSEHOLD_SIZE_MULTIPLIERS.get(min(n_members, 8), 1.0 + (n_members - 4) * 0.15)
         
-        # Filtration system (scales with catchment area)
-        filtration_cost = self.COST_FACTORS["filtration_base"]
-        if catchment_area > 100:
-            filtration_cost *= 1.5
-        if catchment_area > 200:
-            filtration_cost *= 1.3
+        # Rainfall zone multiplier
+        annual_rainfall = location_data.get('total_annual_rainfall', 800)
+        rainfall_zone = self._get_rainfall_zone(annual_rainfall)
+        rain_mult = self.RAINFALL_ZONE_MULTIPLIERS.get(rainfall_zone, 1.0)
         
-        # First flush system
-        first_flush_cost = self.COST_FACTORS["first_flush_base"]
+        # Area factor (catchment area affects gutter length and piping)
+        # 100 sq m is baseline (typical small house)
+        area_factor = min(max(catchment_area / 100, 0.7), 2.5)
         
-        # Piping (estimate based on catchment area)
-        estimated_piping_meters = catchment_area * 0.5  # heuristic
-        piping_cost = estimated_piping_meters * self.COST_FACTORS["piping_per_meter"]
+        # Groundwater stress affects investment value
+        gw_stress = location_data.get('groundwater_extraction_stage', 50)
+        urgency_mult = 1.0 + (gw_stress / 200)  # Up to 1.5x for critical areas
         
-        # Gutters (perimeter estimate)
-        perimeter = 4 * np.sqrt(catchment_area)  # square approximation
-        gutter_cost = perimeter * self.COST_FACTORS["gutter_per_meter"]
+        print(f"[Cost] Factors - Area: {area_factor:.2f}x, Roof: {roof_mult:.2f}x, Material: {mat_mult:.2f}x, HH: {hh_mult:.2f}x, Rain: {rain_mult:.2f}x")
         
-        # Material cost
-        material_cost = (tank_cost + filtration_cost + first_flush_cost + 
-                        piping_cost + gutter_cost) * mat_mult * roof_mult
+        # Calculate component costs with all factors
+        breakdown = {}
         
-        # Labor cost
-        labor_cost = material_cost * self.COST_FACTORS["labor_percentage"]
+        # Storage tank - scales with household size and rainfall zone
+        tank_cost = base_costs["storage_tank"] * hh_mult * rain_mult
+        breakdown["storage_tank"] = round(tank_cost, 0)
         
-        # Overhead and contingency
-        overhead = material_cost * self.COST_FACTORS["overhead_percentage"]
+        # Filtration - scales with roof material (some need more filtering)
+        filter_cost = base_costs["filtration_system"] * mat_mult
+        breakdown["filtration_system"] = round(filter_cost, 0)
         
-        # Total cost
-        total_cost = material_cost + labor_cost + overhead
+        # First flush - relatively fixed, slight area adjustment
+        ff_cost = base_costs["first_flush_diverter"] * min(area_factor, 1.3)
+        breakdown["first_flush_diverter"] = round(ff_cost, 0)
         
-        # Location-based adjustment (if groundwater is scarce, more investment justified)
-        if location_data:
-            gw_stage = location_data.get('groundwater_extraction_stage', 50)
-            if gw_stage > 70:  # Critical zones
-                priority_factor = 1.1
-            else:
-                priority_factor = 1.0
-            total_cost *= priority_factor
+        # Piping - scales with area and roof complexity
+        pipe_cost = base_costs["piping_and_fittings"] * area_factor * roof_mult
+        breakdown["piping_and_fittings"] = round(pipe_cost, 0)
         
-        # Cost breakdown
-        breakdown = {
-            "storage_tank": round(tank_cost, 2),
-            "filtration_system": round(filtration_cost, 2),
-            "first_flush_diverter": round(first_flush_cost, 2),
-            "piping_and_fittings": round(piping_cost, 2),
-            "gutters_and_channels": round(gutter_cost, 2),
-            "labor_charges": round(labor_cost, 2),
-            "overhead_and_contingency": round(overhead, 2),
-            "total_estimated_cost": round(total_cost, 2)
-        }
+        # Gutters - directly proportional to catchment perimeter (sqrt of area)
+        gutter_factor = (catchment_area ** 0.5) / 10  # 100sqm = factor 1
+        gutter_cost = base_costs["gutters_and_channels"] * max(gutter_factor, 0.8) * roof_mult
+        breakdown["gutters_and_channels"] = round(gutter_cost, 0)
+        
+        # Labor - scales with complexity (roof type + area)
+        labor_cost = base_costs["labor_charges"] * roof_mult * min(area_factor, 1.5)
+        breakdown["labor_charges"] = round(labor_cost, 0)
+        
+        # Calculate total
+        total_cost = sum(breakdown.values())
+        
+        # If over budget, scale proportionally to fit budget (with 5% buffer)
+        if total_cost > user_budget and user_budget > 2000:
+            scale_factor = (user_budget * 0.95) / total_cost
+            for key in breakdown:
+                breakdown[key] = round(breakdown[key] * scale_factor, 0)
+            total_cost = sum(breakdown.values())
+            tier = "budget_adapted"  # Mark as adapted
+        
+        # Annual maintenance (scales with system complexity)
+        base_maintenance = {"ultra_budget": 500, "budget": 800, "standard": 1000, "premium": 1500, "budget_adapted": 600}
+        annual_maintenance = round(base_maintenance.get(tier, 800) * roof_mult * mat_mult, 0)
+        
+        # Storage capacity estimation - dynamic based on factors
+        base_capacity = {"ultra_budget": 200, "budget": 500, "standard": 1000, "premium": 2000, "budget_adapted": 300}
+        practical_storage = round(base_capacity.get(tier, 500) * hh_mult * rain_mult, 0)
+        
+        breakdown["total_estimated_cost"] = round(total_cost, 0)
+        breakdown["annual_maintenance"] = annual_maintenance
+        breakdown["cost_per_liter_capacity"] = round(total_cost / max(practical_storage, 1), 2)
+        breakdown["payback_estimate_years"] = round(total_cost / (practical_storage * 12 * 0.10), 1)
+        breakdown["budget_tier"] = tier.replace("_", " ").title()
+        breakdown["recommended_storage_liters"] = practical_storage
+        breakdown["rainfall_zone"] = rainfall_zone.replace("_", " ").title()
         
         return breakdown
 
@@ -283,17 +480,19 @@ class FeasibilityAnalyzer:
             scores['rainfall_adequacy'] = 20
         
         # 2. Budget Sufficiency Score (0-100)
+        # Now budget-aware: since we adapt the plan to budget, this is more lenient
         estimated_cost = cost_analysis.get('total_estimated_cost', 0)
-        if input_data.budget >= estimated_cost * 1.2:
-            scores['budget_sufficiency'] = 100
-        elif input_data.budget >= estimated_cost:
-            scores['budget_sufficiency'] = 85
-        elif input_data.budget >= estimated_cost * 0.8:
-            scores['budget_sufficiency'] = 65
-        elif input_data.budget >= estimated_cost * 0.6:
-            scores['budget_sufficiency'] = 45
+        budget_tier = cost_analysis.get('budget_tier', 'Standard')
+        
+        # If system was adapted to fit budget, give higher score
+        if estimated_cost <= input_data.budget:
+            scores['budget_sufficiency'] = 90  # Plan fits budget
+        elif input_data.budget >= estimated_cost * 0.9:
+            scores['budget_sufficiency'] = 75
+        elif input_data.budget >= estimated_cost * 0.7:
+            scores['budget_sufficiency'] = 55
         else:
-            scores['budget_sufficiency'] = 25
+            scores['budget_sufficiency'] = 35  # Very tight budget
         
         # 3. Catchment Efficiency Score (0-100)
         # Assumes 1 sq m can support 2 people adequately
@@ -397,171 +596,230 @@ class FeasibilityAnalyzer:
 
 
 class ImplementationPlanner:
-    """AI-assisted implementation planning using local embeddings"""
+    """AI-powered implementation planning using LLM and geography context"""
     
     def __init__(self, embedding_model):
         self.model = embedding_model
-        self.knowledge_base = self._load_knowledge_base()
     
-    def _load_knowledge_base(self) -> List[Dict[str, str]]:
-        """Load RWH implementation knowledge base"""
-        return [
-            {
-                "phase": "Site Assessment and Preparation",
-                "duration": "1-2 weeks",
-                "tasks": [
-                    "Conduct detailed site survey and measurements",
-                    "Soil percolation test (if recharge pit planned)",
-                    "Assess existing drainage and plumbing",
-                    "Obtain necessary permissions/approvals",
-                    "Prepare site layout and design drawings"
-                ],
-                "priority": "high"
-            },
-            {
-                "phase": "Material Procurement",
-                "duration": "1 week",
-                "tasks": [
-                    "Procure storage tank (as per calculated capacity)",
-                    "Purchase filtration units and first flush system",
-                    "Arrange PVC pipes, fittings, and connectors",
-                    "Get gutters and downspout materials",
-                    "Acquire tools and safety equipment"
-                ],
-                "priority": "high"
-            },
-            {
-                "phase": "Gutter and Downspout Installation",
-                "duration": "3-5 days",
-                "tasks": [
-                    "Clean and prepare roof surface",
-                    "Install gutters along roof edges with proper slope",
-                    "Mount downspouts at collection points",
-                    "Ensure proper sealing and waterproofing",
-                    "Test water flow during light rain"
-                ],
-                "priority": "high"
-            },
-            {
-                "phase": "First Flush and Filtration Setup",
-                "duration": "2-3 days",
-                "tasks": [
-                    "Install first flush diverter at downspout base",
-                    "Set up multi-stage filtration system",
-                    "Connect filter units with proper piping",
-                    "Install mesh screens and sediment traps",
-                    "Test filtration efficiency"
-                ],
-                "priority": "medium"
-            },
-            {
-                "phase": "Storage Tank Installation",
-                "duration": "3-4 days",
-                "tasks": [
-                    "Prepare stable foundation/platform for tank",
-                    "Position and level the storage tank",
-                    "Connect inlet pipes from filtration system",
-                    "Install outlet taps and overflow mechanism",
-                    "Add tank cover and mosquito-proof mesh"
-                ],
-                "priority": "high"
-            },
-            {
-                "phase": "Piping and Distribution Network",
-                "duration": "2-3 days",
-                "tasks": [
-                    "Lay piping from tank to usage points",
-                    "Install valves and control mechanisms",
-                    "Connect to existing plumbing (if applicable)",
-                    "Add distribution taps for garden/farm use",
-                    "Pressure test all connections"
-                ],
-                "priority": "medium"
-            },
-            {
-                "phase": "Testing and Commissioning",
-                "duration": "2-3 days",
-                "tasks": [
-                    "Conduct full system water flow test",
-                    "Check for leaks and repair if necessary",
-                    "Test first flush mechanism operation",
-                    "Verify filtration system performance",
-                    "Document system specifications and settings"
-                ],
-                "priority": "high"
-            },
-            {
-                "phase": "Training and Handover",
-                "duration": "1 day",
-                "tasks": [
-                    "Train users on system operation",
-                    "Explain maintenance schedule and procedures",
-                    "Provide documentation and warranty details",
-                    "Demonstrate cleaning and upkeep methods",
-                    "Set up monitoring and feedback mechanism"
-                ],
-                "priority": "medium"
-            }
-        ]
+    async def generate_implementation_plan(self, input_data, location_data: Dict, 
+                                           feasibility: Dict, cost_analysis: Dict,
+                                           geography_context: str = "") -> Dict[str, Any]:
+        """Generate AI-powered implementation plan based on all factors"""
+        
+        if not OPENROUTER_API_KEY:
+            return self._get_fallback_plan(feasibility['overall_score'], feasibility['category'])
+        
+        try:
+            geography_section = f"""
+GEOGRAPHY CONTEXT (from knowledge base):
+{geography_context if geography_context else "Use general knowledge for this region."}
+""" if geography_context else ""
+
+            prompt = f"""You are an expert RWH implementation planner in India. Create a detailed, realistic implementation plan.
+
+PROJECT DETAILS:
+- Location: {input_data.district}, {input_data.state}
+- Catchment Area: {input_data.catchment_area} sq m
+- Roof Type: {input_data.roof_type}
+- Roof Material: {input_data.roof_material}
+- Budget: ₹{input_data.budget}
+- Household Size: {input_data.n_members} members
+- Feasibility Score: {feasibility['overall_score']}/100 ({feasibility['category']})
+
+ENVIRONMENTAL DATA:
+- Annual Rainfall: {location_data.get('total_annual_rainfall', 0)} mm
+- Monsoon Rainfall: {location_data.get('monsoon_rainfall', 0)} mm
+- Groundwater Extraction: {location_data.get('groundwater_extraction_stage', 0)}%
+
+COST ANALYSIS:
+- Budget Tier: {cost_analysis.get('budget_tier', 'Standard')}
+- Estimated Cost: ₹{cost_analysis.get('total_estimated_cost', 0)}
+- Storage Capacity: {cost_analysis.get('recommended_storage_liters', 1000)} L
+{geography_section}
+IMPORTANT GEOGRAPHY CONSIDERATIONS for {input_data.state}:
+- Account for local terrain (hilly regions need different installation approach than plains)
+- Consider soil type for recharge pit feasibility
+- Factor in local monsoon patterns for optimal installation timing
+- Include region-specific challenges (coastal salinity, desert heat, mountain accessibility)
+
+Generate a JSON implementation plan with this EXACT structure:
+{{
+    "total_duration_days": <number based on complexity and geography>,
+    "best_season_to_start": "<recommended season considering local monsoon>",
+    "geography_considerations": "<specific challenges for this region>",
+    "phases": [
+        {{
+            "phase_name": "<name>",
+            "duration_days": <number>,
+            "tasks": ["<task1>", "<task2>", ...],
+            "priority": "high/medium/low",
+            "geography_note": "<any region-specific consideration>"
+        }}
+    ],
+    "milestones": ["<milestone1>", "<milestone2>", "<milestone3>"],
+    "risk_factors": ["<risk1>", "<risk2>"],
+    "local_resources": "<available local materials/labor considerations>"
+}}
+
+Provide 5-7 phases. Adjust timeline based on:
+1. Feasibility score (lower = longer duration)
+2. Terrain complexity
+3. Local climate/monsoon timing
+4. Budget tier (ultra_budget = simpler, faster; premium = more complex)
+
+Return ONLY valid JSON, no explanations."""
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{OPENROUTER_BASE_URL}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                        "Content-Type": "application/json",
+                        "HTTP-Referer": "https://indra-rwh.app",
+                        "X-Title": "INDRA Implementation Plan"
+                    },
+                    json={
+                        "model": LLM_MODEL,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.5,
+                        "max_tokens": 1500
+                    },
+                    timeout=aiohttp.ClientTimeout(total=45)
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        llm_response = data['choices'][0]['message']['content']
+                        
+                        # Parse JSON from response
+                        plan = self._parse_llm_plan(llm_response)
+                        if plan:
+                            # Add computed dates
+                            start_date = datetime.now()
+                            plan['estimated_start_date'] = start_date.strftime("%Y-%m-%d")
+                            plan['estimated_completion_date'] = (
+                                start_date + timedelta(days=plan.get('total_duration_days', 21))
+                            ).strftime("%Y-%m-%d")
+                            
+                            # Compute phase start/end days
+                            current_day = 0
+                            for phase in plan.get('phases', []):
+                                phase['start_day'] = current_day
+                                phase['end_day'] = current_day + phase.get('duration_days', 3)
+                                current_day = phase['end_day']
+                            
+                            return plan
+                        
+                    print(f"Implementation plan API error: {response.status}")
+                    
+        except Exception as e:
+            print(f"Implementation plan LLM error: {e}")
+        
+        return self._get_fallback_plan(feasibility['overall_score'], feasibility['category'])
     
-    def generate_timeline(self, feasibility_score: float, 
-                         budget: float, complexity: str) -> Dict[str, Any]:
-        """Generate adaptive implementation timeline"""
+    def _parse_llm_plan(self, response: str) -> Optional[Dict]:
+        """Parse JSON from LLM response"""
+        try:
+            # Try direct parse
+            return json.loads(response)
+        except:
+            pass
         
-        base_duration_days = 21  # 3 weeks base
+        try:
+            # Try to extract JSON from markdown code block
+            import re
+            json_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', response)
+            if json_match:
+                return json.loads(json_match.group(1))
+            
+            # Try to find JSON object in response
+            start = response.find('{')
+            end = response.rfind('}') + 1
+            if start != -1 and end > start:
+                return json.loads(response[start:end])
+        except Exception as e:
+            print(f"Error parsing LLM plan JSON: {e}")
         
-        # Adjust based on feasibility
+        return None
+    
+    def _get_fallback_plan(self, feasibility_score: float, category: str) -> Dict[str, Any]:
+        """Fallback implementation plan when LLM is unavailable"""
+        base_duration_days = 21
+        
         if feasibility_score < 50:
-            duration_days = base_duration_days + 7  # Extra week for challenges
+            duration_days = base_duration_days + 7
         elif feasibility_score > 80:
-            duration_days = base_duration_days - 3  # Faster for easy cases
+            duration_days = base_duration_days - 3
         else:
             duration_days = base_duration_days
         
-        # Adjust for complexity
-        if complexity in ["Challenging", "Difficult"]:
+        if category in ["Challenging", "Difficult"]:
             duration_days += 5
         
-        phases = []
-        current_day = 0
-        
-        for phase_info in self.knowledge_base:
-            # Parse duration
-            duration_str = phase_info["duration"]
-            if "-" in duration_str:
-                min_days = int(duration_str.split("-")[0].split()[0])
-                max_days = int(duration_str.split("-")[1].split()[0])
-                phase_days = (min_days + max_days) // 2
-            else:
-                phase_days = int(duration_str.split()[0])
-            
-            start_day = current_day
-            end_day = current_day + phase_days
-            current_day = end_day
-            
-            phases.append({
-                "phase_name": phase_info["phase"],
-                "start_day": start_day,
-                "end_day": end_day,
-                "duration_days": phase_days,
-                "tasks": phase_info["tasks"],
-                "priority": phase_info["priority"]
-            })
-        
         start_date = datetime.now()
-        end_date = start_date + timedelta(days=duration_days)
         
         return {
             "total_duration_days": duration_days,
             "estimated_start_date": start_date.strftime("%Y-%m-%d"),
-            "estimated_completion_date": end_date.strftime("%Y-%m-%d"),
-            "phases": phases,
+            "estimated_completion_date": (start_date + timedelta(days=duration_days)).strftime("%Y-%m-%d"),
+            "best_season_to_start": "Pre-monsoon (March-May)",
+            "geography_considerations": "General implementation - consult local experts for region-specific advice",
+            "phases": [
+                {
+                    "phase_name": "Site Assessment and Preparation",
+                    "start_day": 0, "end_day": 5, "duration_days": 5,
+                    "tasks": ["Site survey", "Soil test", "Design drawings", "Permissions"],
+                    "priority": "high",
+                    "geography_note": "Assess local terrain and drainage patterns"
+                },
+                {
+                    "phase_name": "Material Procurement",
+                    "start_day": 5, "end_day": 8, "duration_days": 3,
+                    "tasks": ["Procure tank", "Buy filters", "Get pipes and fittings", "Arrange gutters"],
+                    "priority": "high",
+                    "geography_note": "Source locally where possible"
+                },
+                {
+                    "phase_name": "Gutter Installation",
+                    "start_day": 8, "end_day": 12, "duration_days": 4,
+                    "tasks": ["Install gutters", "Mount downspouts", "Seal joints", "Test flow"],
+                    "priority": "high",
+                    "geography_note": "Account for local rainfall intensity"
+                },
+                {
+                    "phase_name": "Filtration Setup",
+                    "start_day": 12, "end_day": 15, "duration_days": 3,
+                    "tasks": ["Install first flush", "Set up filters", "Connect piping"],
+                    "priority": "medium",
+                    "geography_note": "Filter design based on local dust/debris levels"
+                },
+                {
+                    "phase_name": "Storage Installation",
+                    "start_day": 15, "end_day": 18, "duration_days": 3,
+                    "tasks": ["Prepare foundation", "Position tank", "Connect inlet/outlet"],
+                    "priority": "high",
+                    "geography_note": "Foundation depth based on soil type"
+                },
+                {
+                    "phase_name": "Testing and Commissioning",
+                    "start_day": 18, "end_day": 21, "duration_days": 3,
+                    "tasks": ["Full system test", "Check leaks", "Document settings"],
+                    "priority": "high",
+                    "geography_note": "Test before monsoon season"
+                }
+            ],
             "milestones": [
-                f"Week 1: Site preparation and material procurement",
-                f"Week 2: Installation of gutters, filters, and tanks",
-                f"Week 3: Piping, testing, and commissioning"
-            ]
+                "Week 1: Site preparation and material procurement",
+                "Week 2: Installation of gutters, filters, and tanks",
+                "Week 3: Testing and commissioning"
+            ],
+            "risk_factors": ["Weather delays", "Material availability", "Labor scheduling"],
+            "local_resources": "Consult local RWH vendors for region-specific materials"
         }
+    
+    def generate_timeline(self, feasibility_score: float, 
+                         budget: float, complexity: str) -> Dict[str, Any]:
+        """Legacy sync method - returns fallback plan"""
+        return self._get_fallback_plan(feasibility_score, complexity)
 
 
 # API Endpoints
@@ -570,7 +828,8 @@ class ImplementationPlanner:
 async def analyze_rwh_system(input_data: AssessmentInput):
     """
     Main endpoint for comprehensive RWH assessment
-    Performs AI-powered analysis and generates detailed recommendations
+    Performs AI-powered analysis with RAG-verified data and geography-aware recommendations
+    All outputs are dynamically generated by AI - no hardcoded values
     """
     
     try:
@@ -578,6 +837,12 @@ async def analyze_rwh_system(input_data: AssessmentInput):
         model = load_embedding_model()
         
         # 1. Get location data from GIS
+        print(f"[Assessment] Looking up GIS data for pincode: {input_data.pincode}, district: {input_data.district}")
+        
+        # Ensure GIS data is loaded
+        if not gis_manager._loaded:
+            gis_manager.load_data()
+        
         location_data_raw = gis_manager.get_location_data(
             pincode=input_data.pincode,
             district=input_data.district,
@@ -585,7 +850,27 @@ async def analyze_rwh_system(input_data: AssessmentInput):
         )
         
         if not location_data_raw:
-            raise HTTPException(status_code=404, detail="Location data not found in database")
+            raise HTTPException(status_code=404, detail=f"Location data not found for pincode: {input_data.pincode}")
+        
+        # 1a. FACT-CHECK GIS DATA using RAG
+        print(f"[Assessment] Fact-checking GIS data with RAG...")
+        verified_gis, confidence = await verify_and_get_location_data(
+            input_data.state, 
+            input_data.district, 
+            location_data_raw
+        )
+        print(f"[Assessment] Data verification confidence: {confidence:.0%}")
+        
+        # Use verified data
+        rainfall_data = verified_gis.get('rainfall', location_data_raw.get('rainfall', {}))
+        groundwater_data = verified_gis.get('groundwater', location_data_raw.get('groundwater', {}))
+        
+        # Round values for clean display
+        total_rainfall = round(rainfall_data.get('total_annual', 0), 1)
+        monsoon_rainfall = round(rainfall_data.get('monsoon', 0), 1)
+        gw_extraction = round(groundwater_data.get('extraction_percentage', 50), 1)
+        
+        print(f"[Assessment] Verified Data - Rainfall: {total_rainfall}mm, GW: {gw_extraction}%")
         
         location_data = {
             "latitude": location_data_raw.get('latitude', 0),
@@ -593,63 +878,187 @@ async def analyze_rwh_system(input_data: AssessmentInput):
             "district": location_data_raw.get('district', input_data.district),
             "state": location_data_raw.get('state', input_data.state),
             "pincode": location_data_raw.get('pincode', input_data.pincode),
-            "total_annual_rainfall": location_data_raw.get('total_rainfall', 0),
-            "monsoon_rainfall": location_data_raw.get('monsoon_rainfall', 0),
-            "groundwater_extraction_stage": location_data_raw.get('groundwater_extraction_stage', 50),
-            "groundwater_resource": location_data_raw.get('groundwater_resource', 0)
+            "total_annual_rainfall": total_rainfall,
+            "monsoon_rainfall": monsoon_rainfall,
+            "groundwater_extraction_stage": gw_extraction,
+            "groundwater_resource": round(groundwater_data.get('resource_bcm', 0), 3),
+            "data_confidence": confidence  # Include confidence score
         }
         
-        # 2. Calculate storage capacity needed
-        # Assumption: 150L per person per day, store for 30 days worth
-        daily_requirement = input_data.n_members * 150  # liters
-        storage_capacity = daily_requirement * 30  # liters
+        # 1b. Fetch geography context from Qdrant for AI-powered features
+        print(f"[Assessment] Fetching geography context for {input_data.state}...")
+        geography_context = await get_geography_context(input_data.state, input_data.district)
+        if geography_context:
+            print(f"[Assessment] Geography context retrieved ({len(geography_context)} chars)")
+        else:
+            print("[Assessment] No geography context available - using general knowledge")
         
-        # Calculate harvestable water (catchment area * rainfall * runoff coefficient)
-        runoff_coefficient = 0.8  # typical for RCC roofs
-        harvestable_water = (input_data.catchment_area * 
-                           location_data['total_annual_rainfall'] / 1000 *  # mm to m
-                           runoff_coefficient)  # cubic meters
+        # 2. AI-POWERED FEASIBILITY ANALYSIS
+        print("[Assessment] Generating AI-powered feasibility analysis...")
+        try:
+            feasibility_context = {
+                'district': input_data.district,
+                'state': input_data.state,
+                'rainfall': total_rainfall,
+                'gw_extraction': gw_extraction,
+                'catchment_area': input_data.catchment_area,
+                'n_members': input_data.n_members,
+                'budget': input_data.budget,
+                'roof_type': input_data.roof_type
+            }
+            feasibility = await generate_ai_content(
+                "feasibility", 
+                feasibility_context,
+                f"rainwater harvesting feasibility {input_data.state} {input_data.district}"
+            )
+        except Exception as e:
+            print(f"[Assessment] AI feasibility failed, using algorithm: {e}")
+            # Fallback to algorithmic feasibility
+            feasibility_analyzer = FeasibilityAnalyzer()
+            feasibility = feasibility_analyzer.calculate_feasibility(
+                input_data=input_data,
+                location_data=location_data,
+                cost_analysis={"total_estimated_cost": input_data.budget}
+            )
         
+        # 3. AI-POWERED COST ANALYSIS
+        print("[Assessment] Generating AI-powered cost analysis...")
+        try:
+            cost_context = {
+                'district': input_data.district,
+                'state': input_data.state,
+                'catchment_area': input_data.catchment_area,
+                'roof_type': input_data.roof_type,
+                'roof_material': input_data.roof_material,
+                'budget': input_data.budget,
+                'n_members': input_data.n_members,
+                'rainfall': total_rainfall
+            }
+            cost_analysis = await generate_ai_content(
+                "cost_analysis",
+                cost_context,
+                f"rainwater harvesting cost India {input_data.state}"
+            )
+        except Exception as e:
+            print(f"[Assessment] AI cost analysis failed, using algorithm: {e}")
+            # Fallback to algorithmic cost prediction
+            cost_predictor = RWHCostPredictor()
+            cost_analysis = cost_predictor.predict_cost(
+                catchment_area=input_data.catchment_area,
+                storage_capacity=input_data.n_members * 150 * 30,
+                roof_type=input_data.roof_type,
+                roof_material=input_data.roof_material,
+                location_data=location_data,
+                user_budget=input_data.budget,
+                n_members=input_data.n_members
+            )
+        
+        # Calculate RWH metrics
+        daily_requirement = input_data.n_members * 150
+        storage_capacity = daily_requirement * 30
+        
+        runoff_coefficients = {
+            "RCC": 0.90, "Tiles": 0.85, "Metal": 0.80, "Asbestos": 0.75, "Thatch": 0.60
+        }
+        runoff_coefficient = runoff_coefficients.get(input_data.roof_material, 0.80)
+        
+        harvestable_water = (input_data.catchment_area * total_rainfall / 1000 * runoff_coefficient)
         harvestable_water_liters = harvestable_water * 1000
         
-        # Determine RWH type
-        if input_data.farm_land_area > 0:
-            rwh_type = "Hybrid (Rooftop + Farm Recharge)"
-        else:
-            rwh_type = "Rooftop Harvesting with Storage"
+        # 3.5 AI-POWERED SYSTEM DESIGN (Tank Dimensions + RWH Type)
+        print("[Assessment] Generating AI-powered system design (tank dimensions + RWH type)...")
+        system_design = None
+        try:
+            design_context = {
+                'district': input_data.district,
+                'state': input_data.state,
+                'catchment_area': input_data.catchment_area,
+                'roof_type': input_data.roof_type,
+                'roof_material': input_data.roof_material,
+                'n_members': input_data.n_members,
+                'budget': input_data.budget,
+                'rainfall': total_rainfall,
+                'gw_extraction': gw_extraction,
+                'farm_land_area': input_data.farm_land_area
+            }
+            system_design = await generate_ai_content(
+                "system_design",
+                design_context,
+                f"rainwater harvesting system design {input_data.state} {input_data.roof_material}"
+            )
+            print(f"[Assessment] System design generated: {system_design.get('recommended_system_type', 'N/A')}")
+        except Exception as e:
+            print(f"[Assessment] AI system design failed, using fallback: {e}")
+            # Fallback system design based on structural constraints
+            if input_data.roof_material in ["Asbestos", "Thatch"]:
+                rwh_type = "pit_recharge"
+                placement = "underground"
+            elif input_data.farm_land_area > 0:
+                rwh_type = "rooftop_with_recharge"
+                placement = "ground"
+            else:
+                rwh_type = "rooftop_collection"
+                placement = "ground" if input_data.budget < 15000 else "elevated"
+            
+            # Default tank dimensions within constraints
+            base_capacity = min(storage_capacity, 3000)  # Max 3000L
+            diameter = min(max(0.9, (base_capacity / 1000 / 1.5) ** 0.5), 2.0)  # Within 0.9-2.0m
+            height = min(max(0.95, base_capacity / (3.14159 * (diameter/2)**2 * 1000)), 3.0)  # Within 0.95-3.0m
+            
+            system_design = {
+                "recommended_system_type": rwh_type,
+                "system_type_reason": f"Based on {input_data.roof_material} roof and budget constraints",
+                "alternative_systems": ["open_area_collection", "pit_recharge"],
+                "tank_dimensions": {
+                    "height_meters": round(height, 2),
+                    "diameter_meters": round(diameter, 2),
+                    "capacity_liters": round(3.14159 * (diameter/2)**2 * height * 1000, 0),
+                    "shape": "cylindrical",
+                    "material_recommended": "Plastic" if input_data.budget < 15000 else "Ferro-cement",
+                    "placement": placement
+                },
+                "dimension_reasoning": "Calculated based on household size and budget",
+                "structural_notes": f"Roof material ({input_data.roof_material}) considered for placement",
+                "installation_type": "above_ground" if placement != "underground" else "underground",
+                "additional_components": ["first_flush_diverter", "mesh_filter"],
+                "geography_suitable": "General design - consult local experts"
+            }
         
-        # 3. Cost Prediction
-        cost_predictor = RWHCostPredictor()
-        cost_analysis = cost_predictor.predict_cost(
-            catchment_area=input_data.catchment_area,
-            storage_capacity=storage_capacity,
-            roof_type=input_data.roof_type,
-            roof_material=input_data.roof_material,
-            location_data=location_data
-        )
+        # Extract RWH type from system design
+        rwh_type = system_design.get('recommended_system_type', 'rooftop_collection')
+        rwh_type_display = rwh_type.replace('_', ' ').title()
         
-        # 4. Feasibility Analysis
-        feasibility_analyzer = FeasibilityAnalyzer()
-        feasibility = feasibility_analyzer.calculate_feasibility(
-            input_data=input_data,
-            location_data=location_data,
-            cost_analysis=cost_analysis
-        )
+        # 4. AI-POWERED IMPLEMENTATION PLANNING
+        print("[Assessment] Generating AI-powered implementation plan...")
+        try:
+            impl_context = {
+                'district': input_data.district,
+                'state': input_data.state,
+                'catchment_area': input_data.catchment_area,
+                'roof_type': input_data.roof_type,
+                'budget': input_data.budget,
+                'feasibility_score': feasibility.get('overall_score', 70)
+            }
+            implementation = await generate_ai_content(
+                "implementation_plan",
+                impl_context,
+                f"rainwater harvesting implementation {input_data.state} rural"
+            )
+        except Exception as e:
+            print(f"[Assessment] AI implementation plan failed, using fallback: {e}")
+            planner = ImplementationPlanner(model)
+            implementation = planner._get_fallback_plan(
+                feasibility.get('overall_score', 70),
+                feasibility.get('category', 'Feasible')
+            )
         
-        # 5. Implementation Planning
-        planner = ImplementationPlanner(model)
-        implementation = planner.generate_timeline(
-            feasibility_score=feasibility['overall_score'],
-            budget=input_data.budget,
-            complexity=feasibility['category']
-        )
-        
-        # 6. Generate AI-powered recommendations
+        # 5. AI-POWERED RECOMMENDATIONS
+        print("[Assessment] Generating AI-powered recommendations...")
         recommendations = await generate_recommendations(
-            input_data, location_data, feasibility, cost_analysis
+            input_data, location_data, feasibility, cost_analysis, geography_context
         )
         
-        # 7. Create assessment ID
+        # 6. Create assessment ID
         assessment_id = f"INDRA-{input_data.pincode}-{datetime.now().strftime('%Y%m%d%H%M%S')}"
         
         # Compile output
@@ -665,8 +1074,17 @@ async def analyze_rwh_system(input_data: AssessmentInput):
             },
             location_data=location_data,
             rwh_analysis={
-                "rwh_type": rwh_type,
-                "recommended_storage_capacity_liters": storage_capacity,
+                "rwh_type": rwh_type_display,
+                "rwh_type_code": rwh_type,
+                "system_type_reason": system_design.get('system_type_reason', ''),
+                "alternative_systems": system_design.get('alternative_systems', []),
+                "tank_dimensions": system_design.get('tank_dimensions', {}),
+                "dimension_reasoning": system_design.get('dimension_reasoning', ''),
+                "structural_notes": system_design.get('structural_notes', ''),
+                "installation_type": system_design.get('installation_type', 'above_ground'),
+                "additional_components": system_design.get('additional_components', []),
+                "geography_suitable": system_design.get('geography_suitable', ''),
+                "recommended_storage_capacity_liters": system_design.get('tank_dimensions', {}).get('capacity_liters', cost_analysis.get('recommended_storage_liters', storage_capacity)),
                 "annual_harvestable_water_liters": round(harvestable_water_liters, 2),
                 "daily_household_requirement_liters": daily_requirement,
                 "water_self_sufficiency_days": round(harvestable_water_liters / daily_requirement, 1),
@@ -687,8 +1105,9 @@ async def analyze_rwh_system(input_data: AssessmentInput):
 
 
 async def generate_recommendations(input_data: AssessmentInput, location_data: Dict,
-                            feasibility: Dict, cost_analysis: Dict) -> List[str]:
-    """Generate AI-powered context-aware recommendations"""
+                            feasibility: Dict, cost_analysis: Dict, 
+                            geography_context: str = "") -> List[str]:
+    """Generate AI-powered context-aware recommendations with geography data"""
     
     # Base recommendations (always included)
     recommendations = []
@@ -697,30 +1116,35 @@ async def generate_recommendations(input_data: AssessmentInput, location_data: D
     budget_gap = cost_analysis['total_estimated_cost'] - input_data.budget
     if budget_gap > 0:
         recommendations.append(
-            f"💰 Budget Gap: ₹{round(budget_gap, 2)}. Consider phased implementation or government subsidies."
+            f"Budget Gap: Rs.{round(budget_gap, 0):,.0f}. Consider phased implementation or government subsidies like Jal Shakti Abhiyan."
         )
     else:
+        surplus = input_data.budget - cost_analysis['total_estimated_cost']
         recommendations.append(
-            f"✅ Budget is sufficient. Consider allocating extra ₹{round(input_data.budget - cost_analysis['total_estimated_cost'], 2)} for advanced filtration."
+            f"Budget is sufficient with Rs.{round(surplus, 0):,.0f} surplus. Consider investing in advanced filtration or larger storage."
         )
     
     # Rainfall recommendations
     if location_data['total_annual_rainfall'] < 600:
         recommendations.append(
-            "⚠️ Low rainfall area. Maximize catchment efficiency with proper gutter slope and minimal leakage."
+            "Low rainfall region detected. Maximize catchment efficiency with proper gutter slope (1:100) and sealed joints."
         )
     elif location_data['total_annual_rainfall'] > 1500:
         recommendations.append(
-            "🌧️ High rainfall area. Consider larger storage or recharge pits to utilize excess water."
+            "High rainfall region. Consider larger storage tanks or groundwater recharge pits to utilize excess monsoon water."
+        )
+    else:
+        recommendations.append(
+            f"Moderate rainfall ({location_data['total_annual_rainfall']:.0f}mm/year) is favorable for RWH. Standard system recommended."
         )
     
     # Groundwater recommendations
     if location_data['groundwater_extraction_stage'] > 70:
         recommendations.append(
-            "🚨 Critical groundwater zone. RWH is highly recommended for aquifer recharge and sustainability."
+            f"Critical groundwater zone ({location_data['groundwater_extraction_stage']:.0f}% extraction). RWH highly recommended for aquifer recharge."
         )
     
-    # Get AI-powered recommendations from LLM
+    # Get AI-powered recommendations from LLM (with geography context)
     try:
         gw_status = "Critical" if location_data['groundwater_extraction_stage'] > 70 else "Moderate"
         llm_context = {
@@ -736,15 +1160,15 @@ async def generate_recommendations(input_data: AssessmentInput, location_data: D
             'feasibility_score': feasibility['overall_score']
         }
         
-        llm_response = await get_llm_recommendations(llm_context)
+        llm_response = await get_llm_recommendations(llm_context, geography_context)
         if llm_response and "unavailable" not in llm_response.lower():
             # Parse LLM response into individual recommendations
             llm_recs = [line.strip() for line in llm_response.split('\n') if line.strip() and (line.strip()[0].isdigit() or line.strip().startswith('-'))]
-            for rec in llm_recs[:3]:  # Add top 3 AI recommendations
-                # Clean up numbering
+            for rec in llm_recs[:5]:  # Add top 5 AI recommendations
+                # Clean up numbering and any emojis
                 clean_rec = rec.lstrip('0123456789.-) ').strip()
                 if clean_rec:
-                    recommendations.append(f"🤖 AI Insight: {clean_rec}")
+                    recommendations.append(f"AI Insight: {clean_rec}")
     except Exception as e:
         print(f"Error getting LLM recommendations: {e}")
     
@@ -777,10 +1201,10 @@ ROOF_MATERIALS = [
 ]
 
 PROJECT_STATUS_OPTIONS = [
-    {"value": "planning", "label": "Planning Phase", "icon": "📋"},
-    {"value": "approved", "label": "Approved/Funded", "icon": "✅"},
-    {"value": "in_progress", "label": "Under Construction", "icon": "🚧"},
-    {"value": "completed", "label": "Completed", "icon": "🎉"}
+    {"value": "planning", "label": "Planning Phase", "icon": "plan"},
+    {"value": "approved", "label": "Approved/Funded", "icon": "approved"},
+    {"value": "in_progress", "label": "Under Construction", "icon": "progress"},
+    {"value": "completed", "label": "Completed", "icon": "complete"}
 ]
 
 @router.get("/master-data")

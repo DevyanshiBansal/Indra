@@ -1,16 +1,18 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { useEffect } from 'react';
 import { ThemeProvider, useTheme } from './contexts/ThemeContext';
+import { AuthProvider } from './contexts/AuthContext';
 import { Navbar } from './components/Navbar';
 import { Footer } from './components/Footer';
 import { AIChatbot } from './components/AIChatbot';
 
 import { LandingPage } from './pages/urban/LandingPage';
+import { CommunityDashboard } from './pages/gramin/CommunityDashboard';
 import { AssessmentPage } from './pages/urban/AssessmentPage';
 import { VisualizerPage } from './pages/urban/VisualizerPage';
 import { VendorConnectPage } from './pages/urban/VendorConnectPage';
+import { ProfilePage } from './pages/urban/ProfilePage';
 
-import { DashboardPage } from './pages/gramin/DashboardPage';
 import { WaterManagementPage } from './pages/gramin/WaterManagementPage';
 import { SmartCroppingPage } from './pages/gramin/SmartCroppingPage';
 
@@ -34,8 +36,9 @@ function AppContent() {
           <Route path="/assessment" element={<AssessmentPage />} />
           <Route path="/visualizer" element={<VisualizerPage />} />
           <Route path="/vendors" element={<VendorConnectPage />} />
+          <Route path="/profile" element={<ProfilePage />} />
 
-          <Route path="/gramin" element={<DashboardPage />} />
+          <Route path="/gramin" element={<CommunityDashboard />} />
           <Route path="/gramin/water-management" element={<WaterManagementPage />} />
           <Route path="/gramin/smart-cropping" element={<SmartCroppingPage />} />
 
@@ -51,9 +54,11 @@ function AppContent() {
 function App() {
   return (
     <BrowserRouter>
-      <ThemeProvider>
-        <AppContent />
-      </ThemeProvider>
+      <AuthProvider>
+        <ThemeProvider>
+          <AppContent />
+        </ThemeProvider>
+      </AuthProvider>
     </BrowserRouter>
   );
 }

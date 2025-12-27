@@ -8,7 +8,7 @@ interface Message {
 }
 
 export function AIChatbot() {
-  const { colors } = useTheme();
+  const { colors, mode } = useTheme();
   const [isOpen, setIsOpen] = useState(false);
   const [messages, setMessages] = useState<Message[]>([
     {
@@ -27,18 +27,34 @@ export function AIChatbot() {
     setMessages((prev) => [...prev, { role: 'user', content: userMessage }]);
     setIsLoading(true);
 
-    setTimeout(() => {
-      const responses = [
-        'Rainwater harvesting can save up to 40% of your water needs. Would you like to know more about implementation costs?',
-        'For a typical household, you need approximately 1000 liters storage capacity. I can help you calculate the exact requirement.',
-        'The payback period for rainwater harvesting systems is typically 3-5 years. Would you like a detailed cost breakdown?',
-        'I recommend starting with a rooftop collection system. It is the most cost-effective option for urban areas.',
-        'For rural areas, we recommend community-based harvesting systems that serve multiple households efficiently.',
-      ];
-      const response = responses[Math.floor(Math.random() * responses.length)];
-      setMessages((prev) => [...prev, { role: 'assistant', content: response }]);
+    try {
+      // Determine which chatbot to use based on mode
+      const endpoint = mode === 'urban' 
+        ? 'http://localhost:8000/api/chatbot/standard'
+        : 'http://localhost:8000/api/chatbot/rural';
+
+      const response = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: userMessage }),
+      });
+
+      if (!response.ok) throw new Error('Failed to get response');
+
+      const data = await response.json();
+      setMessages((prev) => [...prev, { role: 'assistant', content: data.response }]);
+    } catch (error) {
+      console.error('Chatbot error:', error);
+      setMessages((prev) => [
+        ...prev,
+        { 
+          role: 'assistant', 
+          content: 'Sorry, I encountered an error. Please try again or check if the backend is running.' 
+        }
+      ]);
+    } finally {
       setIsLoading(false);
-    }, 1000);
+    }
   };
 
   return (

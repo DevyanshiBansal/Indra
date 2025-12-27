@@ -7,11 +7,12 @@ import sys
 from typing import Optional
 from pydantic import BaseModel
 
-QDRANT_URL = "qdrant.io"
-QDRANT_API_KEY = "api_key_123456"
-OPENROUTER_API_KEY = "sk-or-v1"
-COLLECTION_NAME = "standrd_rag"
-LLM_MODEL = "nvidia/nemotron-3-nano-30b-a3b:free" 
+# Import config
+from config import (
+    QDRANT_URL, QDRANT_API_KEY, OPENROUTER_API_KEY,
+    RAG_COLLECTION_NAME, LLM_MODEL, LLM_TEMPERATURE,
+    EMBEDDING_MODEL_PATH, OPENROUTER_BASE_URL, RAG_RETRIEVER_K
+)
 
 # --- 2. IMPORTS ---
 try:
@@ -65,31 +66,31 @@ class RuralChatbot:
             print("Initializing Rural Chatbot...")
             
             self.embeddings = HuggingFaceEmbeddings(
-                model_name="./models/all-MiniLM-L6-v2",
+                model_name=EMBEDDING_MODEL_PATH,
                 encode_kwargs={'normalize_embeddings': False}
             )
             
             client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
             collections = client.get_collections().collections
             
-            if not any(c.name == COLLECTION_NAME for c in collections):
-                print(f"Warning: Collection '{COLLECTION_NAME}' not found")
+            if not any(c.name == RAG_COLLECTION_NAME for c in collections):
+                print(f"Warning: Collection '{RAG_COLLECTION_NAME}' not found")
                 return
             
             vector_store = QdrantVectorStore.from_existing_collection(
                 embedding=self.embeddings,
-                collection_name=COLLECTION_NAME,
+                collection_name=RAG_COLLECTION_NAME,
                 url=QDRANT_URL,
                 api_key=QDRANT_API_KEY
             )
             
-            self.retriever = vector_store.as_retriever(search_kwargs={"k": 2})
+            self.retriever = vector_store.as_retriever(search_kwargs={"k": RAG_RETRIEVER_K})
             
             self.llm = ChatOpenAI(
                 model=LLM_MODEL,
                 openai_api_key=OPENROUTER_API_KEY,
-                openai_api_base="https://openrouter.ai/api/v1",
-                temperature=0.3,
+                openai_api_base=OPENROUTER_BASE_URL,
+                temperature=LLM_TEMPERATURE,
                 max_tokens=300
             )
             

@@ -14,10 +14,14 @@
     "@react-three/drei": "^9.106.0",
     "@react-three/fiber": "^8.16.8",
     "@supabase/supabase-js": "^2.57.4",
+    "@types/three": "^0.182.0",
+    "firebase": "^12.7.0",
+    "framer-motion": "^12.23.26",
     "lucide-react": "^0.344.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-router-dom": "^6.30.2",
+    "recharts": "^3.6.0",
     "three": "^0.165.0"
   },
   "devDependencies": {
